@@ -1,0 +1,87 @@
+# 每 5 分钟：① 访问 Render 防休眠 ② 检查 LunaTV 片源，丢了自动写回
+# 需要 3 个 Repository secrets：LUNA_USER / LUNA_PASS / LUNA_CONFIG
+name: lunatv-keepalive
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lunatv-keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Wake Render and repair sources
+        env:
+          BASE: https://lunatv-db80.onrender.com
+          LUNA_USER: ${{ secrets.LUNA_USER }}
+          LUNA_PASS: ${{ secrets.LUNA_PASS }}
+          LUNA_CONFIG: ${{ secrets.LUNA_CONFIG }}
+        run: |
+          python3 - <<'PY'
+          import json, os, time, urllib.request, http.cookiejar
+
+          base = os.environ['BASE']
+          user = os.environ['LUNA_USER']
+          pw = os.environ['LUNA_PASS']
+          cfg = os.environ['LUNA_CONFIG']
+
+          def req(url, data=None, headers=None, opener=None):
+              r = urllib.request.Request(url, data=data, headers=headers or {})
+              return (opener.open(r, timeout=120) if opener else urllib.request.urlopen(r, timeout=120))
+
+          # 1) 唤醒（Render 免费实例休眠时首次请求要等 30~60 秒）
+          for i in range(30):
+              try:
+                  req(base + '/api/server-config')
+                  print(f'awake after {i} retries')
+                  break
+              except Exception as e:
+                  print(f'wake retry {i}: {type(e).__name__}')
+                  time.sleep(5)
+
+          # 2) 登录
+          cj = http.cookiejar.CookieJar()
+          op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+          r = req(base + '/api/login',
+                  data=json.dumps({'username': user, 'password': pw}).encode(),
+                  headers={'content-type': 'application/json'}, opener=op)
+          print('login:', r.status)
+
+          # 3) 检查片源
+          d = json.load(req(base + '/api/admin/config', opener=op))
+          c = d.get('Config', d)
+          n = len([s for s in (c.get('SourceConfig') or []) if not s.get('disabled')])
+          print('sources:', n)
+
+          # 4) 丢了就写回
+          if n == 0:
+              r = req(base + '/api/admin/config_file',
+                      data=json.dumps({'configFile': cfg}).encode(),
+                      headers={'content-type': 'application/json'}, opener=op)
+              print('reseeded:', r.status)
+          else:
+              print('sources ok, nothing to do')
+          PY
+
+      - name: Keep the repo active (GitHub pauses schedules after 60 quiet days)
+        run: |
+          set -e
+          LAST=$(cat .keepalive 2>/dev/null || echo 0)
+          NOW=$(date +%s)
+          if [ $((NOW - LAST)) -gt 2160000 ]; then   # 25 天
+            date -u > .keepalive
+            git config user.name "keepalive-bot"
+            git config user.email "keepalive-bot@users.noreply.github.com"
+            git add .keepalive
+            git commit -m "keepalive $(date -u +%F)" || true
+            git push || true
+          fi
